@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/shukhov/ytapi/client"
 	"go.ytsaurus.tech/yt/go/ypath"
 	"log"
 	"reflect"
 	"runtime"
 	"strings"
 	"sync"
-	"ytapi/client"
 )
 
 var BatchSize = 1000000

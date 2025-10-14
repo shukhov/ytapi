@@ -3,12 +3,12 @@ package selector
 import (
 	"context"
 	"fmt"
+	"github.com/shukhov/ytapi/client"
+	"github.com/shukhov/ytapi/tools/table"
 	"go.ytsaurus.tech/yt/go/yt"
 	"golang.org/x/exp/rand"
 	"log"
 	"time"
-	"ytapi/client"
-	"ytapi/tools/table"
 )
 
 var (
