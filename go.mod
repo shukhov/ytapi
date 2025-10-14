@@ -1,4 +1,4 @@
-module ytapi
+module github.com/shukhov/ytapi
 
 go 1.24.2
 
