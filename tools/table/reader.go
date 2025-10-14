@@ -34,13 +34,12 @@ func NewReader(client *client.Client, path string, context *context.Context) (*R
 	if err != nil {
 		return nil, err
 	}
-	reader := &Reader{
+	return &Reader{
 		Client:   client,
 		Ctx:      context,
 		Path:     ypath.Path(path),
 		RowCount: rowCount,
-	}
-	return reader, nil
+	}, nil
 }
 
 func upperFirst(s string) string {
