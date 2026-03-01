@@ -1,18 +1,14 @@
 package table
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"github.com/shukhov/ytapi/client"
 	"github.com/shukhov/ytapi/tools/mem_storage"
 	"go.ytsaurus.tech/library/go/ptr"
 	"go.ytsaurus.tech/yt/go/schema"
-	"go.ytsaurus.tech/yt/go/skiff"
 	"go.ytsaurus.tech/yt/go/ypath"
 	"go.ytsaurus.tech/yt/go/yt"
-	"log"
 	"reflect"
 	"strings"
 	"sync"
@@ -33,12 +29,12 @@ type Reader struct {
 
 func NewReader(client *client.Client, path string, context *context.Context) (*Reader, error) {
 	var rowCount uint64
-	var schema schema.Schema
+	var tableSchema schema.Schema
 	err := client.Client.GetNode(*context, ypath.Path(path).Child("@row_count"), &rowCount, nil)
 	if err != nil {
 		return nil, err
 	}
-	err = client.Client.GetNode(*context, ypath.Path(path).Attr("schema"), &schema, nil)
+	err = client.Client.GetNode(*context, ypath.Path(path).Attr("schema"), &tableSchema, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +43,7 @@ func NewReader(client *client.Client, path string, context *context.Context) (*R
 		Ctx:      context,
 		Path:     ypath.Path(path),
 		RowCount: rowCount,
-		Schema:   schema,
+		Schema:   tableSchema,
 	}
 	if err = reader.InferType(); err != nil {
 		return nil, err
@@ -175,19 +171,14 @@ func (reader *Reader) ReadPartition(offset, limit uint64) (reflect.Value, error)
 	currentPart := fmt.Sprintf("[#%d:#%d]", offset, limit)
 	partitionPath := ypath.Path(reader.Path.String() + currentPart)
 
-	//tableSchema := skiff.FromTableSchema(reader.Schema)
 	rs, err := reader.Client.Client.ReadTable(*reader.Ctx, partitionPath, &yt.ReadTableOptions{
-		//Format: skiff.Format{
-		//	Name:         "skiff",
-		//	TableSchemas: []any{&tableSchema},
-		//},
 		Unordered: true,
 		Smart:     ptr.Bool(true),
 	})
 	if err != nil {
 		return reflect.Value{}, err
 	}
-	defer rs.Close()
+	defer func() { _ = rs.Close() }()
 
 	for rs.Next() {
 		rowPtr := reflect.New(reader.rowType) // *T
@@ -204,58 +195,15 @@ func (reader *Reader) ReadPartition(offset, limit uint64) (reflect.Value, error)
 	return partition, nil
 }
 
-func (reader *Reader) ReadPartitionJson(limit, offset uint64) RowJson {
-	currentPart := fmt.Sprintf("[#%d:#%d]", limit, offset)
-	partitionPath := ypath.Path(reader.Path.String() + currentPart)
-	tableSchema := skiff.FromTableSchema(reader.Schema)
-	readerSession, err := reader.Client.Client.ReadTable(*reader.Ctx, partitionPath, &yt.ReadTableOptions{Format: skiff.Format{
-		Name:         "skiff",
-		TableSchemas: []any{&tableSchema},
-	}})
-	if err != nil {
-		log.Fatalf("Error reading table: %v", err)
-		return nil
-	}
-	defer readerSession.Close()
-
-	var buffer bytes.Buffer
-	first := true
-	var i = 0
-	for readerSession.Next() {
-		var row Row
-		if err := readerSession.Scan(&row); err != nil {
-			log.Printf("Error scanning row: %v", err)
-			continue
-		}
-
-		marshalled, err := json.Marshal(row)
-		if err != nil {
-			log.Printf("Error marshalling row: %v", err)
-			continue
-		}
-
-		if !first {
-			buffer.WriteByte(',')
-		} else {
-			first = false
-		}
-
-		buffer.Write(marshalled)
-		i++
-	}
-	fmt.Println("count: ", i)
-	return buffer.Bytes()
-}
-
 func (reader *Reader) ReadTableJson(tableName string) (*mem_storage.Table, error) {
 	newTable, err := mem_storage.NewTable(tableName, "json")
 	if err != nil {
 		return nil, err
 	}
 
-	w, err := newTable.NewWriter()
+	writer, err := newTable.NewWriter()
 	if err != nil {
-		newTable.Drop()
+		func() { _ = newTable.Drop() }()
 		return nil, fmt.Errorf("failed to create new writer: %w", err)
 	}
 
@@ -291,7 +239,7 @@ func (reader *Reader) ReadTableJson(tableName string) (*mem_storage.Table, error
 				return
 			}
 
-			if err := w.WritePartition(part.Interface()); err != nil {
+			if err := writer.WritePartition(part.Interface()); err != nil {
 				select {
 				case errCh <- err:
 				default:
@@ -305,33 +253,12 @@ func (reader *Reader) ReadTableJson(tableName string) (*mem_storage.Table, error
 	close(errCh)
 
 	if err := <-errCh; err != nil {
-		newTable.Drop()
+		func() { _ = newTable.Drop() }()
 		return nil, fmt.Errorf("failed to write partition: %+v", err)
 	}
 
 	return newTable, nil
 }
-
-/*func (reader *Reader) ReadTable() (*[]Row, error) {
-	var table = make([]Row, 0, reader.RowCount)
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for i := 0; i <= int(reader.RowCount); i += BatchSize {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			part := reader.ReadPartition(uint64(i), uint64(i+BatchSize-1))
-			mu.Lock()
-			table = append(table, *part...)
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
-	runtime.GC()
-	return &table, nil
-}*/
 
 func (reader *Reader) ReadTable() (reflect.Value, error) {
 	rowCount := reader.RowCount

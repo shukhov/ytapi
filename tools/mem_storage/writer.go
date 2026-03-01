@@ -53,59 +53,32 @@ func generateMeta(tablePath string, contentHead any, length uint64) (*Partition,
 }
 
 func extractFieldNames(v any) ([]string, error) {
-	if v == nil {
-		return nil, fmt.Errorf("contentHead is nil")
-	}
 
 	rv := reflect.ValueOf(v)
 	rt := rv.Type()
 
-	// разыменуем указатели
-	for rt.Kind() == reflect.Pointer {
-		if rv.IsNil() {
-			return nil, fmt.Errorf("contentHead is nil pointer")
-		}
-		rv = rv.Elem()
-		rt = rv.Type()
+	if rt.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("expected struct, got %s", rt.Kind())
 	}
 
-	switch rt.Kind() {
-	case reflect.Map:
-		// ожидаем map[string]any (или совместимое)
-		if rt.Key().Kind() != reflect.String {
-			return nil, fmt.Errorf("map key must be string, got %s", rt.Key())
-		}
-		keys := rv.MapKeys()
-		out := make([]string, 0, len(keys))
-		for _, k := range keys {
-			out = append(out, k.String())
-		}
-		return out, nil
+	out := make([]string, 0, rt.NumField())
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
 
-	case reflect.Struct:
-		out := make([]string, 0, rt.NumField())
-		for i := 0; i < rt.NumField(); i++ {
-			f := rt.Field(i)
-
-			// берём имя из yson-тега, если есть, иначе имя поля
-			tag := f.Tag.Get("yson")
-			if tag != "" && tag != "-" {
-				// yson:"name,omitempty" -> "name"
-				if idx := strings.IndexByte(tag, ','); idx >= 0 {
-					tag = tag[:idx]
-				}
-				if tag != "" {
-					out = append(out, tag)
-					continue
-				}
+		// Берём имя из yson-тега, если есть, иначе имя поля
+		tag := f.Tag.Get("yson")
+		if tag != "" && tag != "-" {
+			if idx := strings.IndexByte(tag, ','); idx >= 0 {
+				tag = tag[:idx]
 			}
-			out = append(out, f.Name)
+			if tag != "" {
+				out = append(out, tag)
+				continue
+			}
 		}
-		return out, nil
-
-	default:
-		return nil, fmt.Errorf("unsupported contentHead kind: %s", rt.Kind())
+		out = append(out, f.Name)
 	}
+	return out, nil
 }
 
 func (writer *MemTableJsonWriter) WritePartition(content any) error {
@@ -117,7 +90,7 @@ func (writer *MemTableJsonWriter) WritePartition(content any) error {
 		return nil // нечего писать
 	}
 
-	// Для meta берём первый элемент как map/struct/что угодно — generateMeta должен это уметь.
+	// Для meta берём первый элемент
 	first := v.Index(0).Interface()
 
 	partition, err := generateMeta(writer.Table.Path, first, uint64(v.Len()))
@@ -125,7 +98,7 @@ func (writer *MemTableJsonWriter) WritePartition(content any) error {
 		return fmt.Errorf("error to create partition metainformation: %w", err)
 	}
 
-	jsn, err := json.Marshal(content) // content — это []T или []map[string]any
+	jsn, err := json.Marshal(content)
 	if err != nil {
 		return fmt.Errorf("failed to serialize content: %w", err)
 	}

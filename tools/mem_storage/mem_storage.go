@@ -65,7 +65,7 @@ func NewTable(Name string, Format string) (*Table, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed when trying create file meta.json, error: %v", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	jsn, err := json.Marshal(table)
 
