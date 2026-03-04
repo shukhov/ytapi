@@ -6,8 +6,8 @@ import (
 	"github.com/shukhov/ytapi/client"
 	"github.com/shukhov/ytapi/tools/table"
 	"go.ytsaurus.tech/yt/go/yt"
-	"golang.org/x/exp/rand"
 	"log"
+	"math/rand/v2"
 	"time"
 )
 
@@ -29,7 +29,7 @@ type Select struct {
 }
 
 func formatQuery(cluster string, query string) (string, string) {
-	tableName := fmt.Sprintf("%d_%d", time.Now().Second(), rand.Int31())
+	tableName := fmt.Sprintf("%d_%d", time.Now().Second(), rand.Uint32())
 	tempTable := fmt.Sprintf("%s/%s", TempDir, tableName)
 	ttl := time.Now().AddDate(0, 0, 3).UTC().Format("2006-01-02T15:04:05")
 
