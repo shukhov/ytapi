@@ -18,13 +18,13 @@ import (
 )
 
 type Reader struct {
-	Path      ypath.Path
-	Ctx       *context.Context
-	Client    *client.Client
-	Schema    schema.Schema
-	RowCount  uint64
-	BatchSize uint64
-	rowType   reflect.Type
+	Path        ypath.Path
+	Ctx         *context.Context
+	Client      *client.Client
+	Schema      schema.Schema
+	RowCount    uint64
+	BatchSize   uint64
+	tableSchema reflect.Type
 }
 
 func NewReader(client *client.Client, path string, context *context.Context) (*Reader, error) {
@@ -45,7 +45,7 @@ func NewReader(client *client.Client, path string, context *context.Context) (*R
 		RowCount: rowCount,
 		Schema:   tableSchema,
 	}
-	if err = reader.InferType(); err != nil {
+	if err = reader.InferSchema(); err != nil {
 		return nil, err
 	}
 	return &reader, nil
@@ -133,7 +133,7 @@ func exportFieldName(s string) string {
 	return out
 }
 
-func (reader *Reader) InferType() error {
+func (reader *Reader) InferSchema() error {
 	fields := make([]reflect.StructField, 0, len(reader.Schema.Columns))
 
 	for _, col := range reader.Schema.Columns {
@@ -154,7 +154,7 @@ func (reader *Reader) InferType() error {
 
 	st := reflect.StructOf(fields)
 	v := reflect.New(st).Elem()
-	reader.rowType = v.Type()
+	reader.tableSchema = v.Type()
 
 	return nil
 }
@@ -165,7 +165,7 @@ func (reader *Reader) ReadPartition(offset, limit uint64) (reflect.Value, error)
 		limit = offset
 	}
 
-	sliceType := reflect.SliceOf(reader.rowType)
+	sliceType := reflect.SliceOf(reader.tableSchema)
 	partition := reflect.MakeSlice(sliceType, 0, int(limit-offset))
 
 	currentPart := fmt.Sprintf("[#%d:#%d]", offset, limit)
@@ -181,7 +181,7 @@ func (reader *Reader) ReadPartition(offset, limit uint64) (reflect.Value, error)
 	defer func() { _ = rs.Close() }()
 
 	for rs.Next() {
-		rowPtr := reflect.New(reader.rowType) // *T
+		rowPtr := reflect.New(reader.tableSchema) // *T
 		if err := rs.Scan(rowPtr.Interface()); err != nil {
 			fmt.Println(err)
 			return reflect.Value{}, err
@@ -264,7 +264,7 @@ func (reader *Reader) ReadTable() (reflect.Value, error) {
 	rowCount := reader.RowCount
 	batchSize := GetBatchSize()
 
-	sliceType := reflect.SliceOf(reader.rowType)
+	sliceType := reflect.SliceOf(reader.tableSchema)
 	table := reflect.MakeSlice(sliceType, 0, int(rowCount))
 
 	var wg sync.WaitGroup
