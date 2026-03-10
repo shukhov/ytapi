@@ -1,181 +1,313 @@
 package table
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"github.com/shukhov/ytapi/client"
+	"github.com/shukhov/ytapi/tools/mem_storage"
+	"go.ytsaurus.tech/library/go/ptr"
+	"go.ytsaurus.tech/yt/go/schema"
 	"go.ytsaurus.tech/yt/go/ypath"
-	"log"
+	"go.ytsaurus.tech/yt/go/yt"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
-var BatchSize = 1000000
-
 type Reader struct {
-	Path      ypath.Path
-	Ctx       *context.Context
-	Client    *client.Client
-	RowCount  uint64
-	BatchSize uint64
+	Path        ypath.Path
+	Ctx         *context.Context
+	Client      *client.Client
+	Schema      schema.Schema
+	RowCount    uint64
+	BatchSize   uint64
+	tableSchema reflect.Type
 }
-
-type Row = map[string]interface{}
-
-type RowJson = []byte
 
 func NewReader(client *client.Client, path string, context *context.Context) (*Reader, error) {
 	var rowCount uint64
+	var tableSchema schema.Schema
 	err := client.Client.GetNode(*context, ypath.Path(path).Child("@row_count"), &rowCount, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &Reader{
+	err = client.Client.GetNode(*context, ypath.Path(path).Attr("schema"), &tableSchema, nil)
+	if err != nil {
+		return nil, err
+	}
+	var reader = Reader{
 		Client:   client,
 		Ctx:      context,
 		Path:     ypath.Path(path),
 		RowCount: rowCount,
-	}, nil
+		Schema:   tableSchema,
+	}
+	if err = reader.InferSchema(); err != nil {
+		return nil, err
+	}
+	return &reader, nil
 }
 
-func upperFirst(s string) string {
+func ReflectType(t schema.Type) (reflect.Type, error) {
+	switch t {
+	case schema.TypeInt64:
+		return reflect.TypeOf(int64(0)), nil
+	case schema.TypeInt32:
+		return reflect.TypeOf(int32(0)), nil
+	case schema.TypeInt16:
+		return reflect.TypeOf(int16(0)), nil
+	case schema.TypeInt8:
+		return reflect.TypeOf(int8(0)), nil
+
+	case schema.TypeUint64:
+		return reflect.TypeOf(uint64(0)), nil
+	case schema.TypeUint32:
+		return reflect.TypeOf(uint32(0)), nil
+	case schema.TypeUint16:
+		return reflect.TypeOf(uint16(0)), nil
+	case schema.TypeUint8:
+		return reflect.TypeOf(uint8(0)), nil
+
+	case schema.TypeFloat32:
+		return reflect.TypeOf(float32(0)), nil
+	case schema.TypeFloat64:
+		return reflect.TypeOf(float64(0)), nil
+
+	case schema.TypeBytes:
+		return reflect.TypeOf("а"), nil
+	case schema.TypeString:
+		return reflect.TypeOf("а"), nil
+
+	case schema.TypeBoolean:
+		return reflect.TypeOf(false), nil
+
+	case schema.TypeAny, schema.TypeNull:
+		return reflect.TypeOf((*any)(nil)).Elem(), nil
+
+	case schema.TypeDate, schema.TypeDatetime, schema.TypeTimestamp:
+		return reflect.TypeOf(time.Millisecond), nil
+	case schema.TypeInterval:
+		return reflect.TypeOf(time.Duration(0)), nil
+
+	default:
+		return nil, fmt.Errorf("unknown type: %q", t)
+	}
+}
+
+// делает Exported Go identifier из snake_case / произвольной строки.
+func exportFieldName(s string) string {
+	s = strings.TrimSpace(s)
 	if s == "" {
-		return ""
+		return "Field"
 	}
-	return string(s[0]-32) + s[1:]
+
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == '_' || r == '-' || r == ' ' || r == '.'
+	})
+
+	var b strings.Builder
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(p)
+		if r == utf8.RuneError && size == 0 {
+			continue
+		}
+		b.WriteRune(unicode.ToUpper(r))
+		b.WriteString(p[size:])
+	}
+
+	out := b.String()
+	if out == "" {
+		return "Field"
+	}
+
+	r, _ := utf8.DecodeRuneInString(out)
+	if !unicode.IsLetter(r) && r != '_' {
+		out = "Field" + out
+	}
+	return out
 }
 
-func (reader *Reader) InferType() reflect.Value {
-	var r, _ = reader.Client.Client.ReadTable(*reader.Ctx, reader.Path, nil)
-	defer r.Close()
-	var abstractRow map[string]interface{}
-	r.Next()
-	err := r.Scan(&abstractRow)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fields := make([]reflect.StructField, 0, len(abstractRow))
-	fmt.Println(abstractRow)
-	for key, value := range abstractRow {
+func (reader *Reader) InferSchema() error {
+	fields := make([]reflect.StructField, 0, len(reader.Schema.Columns))
+
+	for _, col := range reader.Schema.Columns {
+		typ, err := ReflectType(col.Type)
+		if err != nil {
+			return err
+		}
+		if !col.Required {
+			typ = reflect.PointerTo(typ)
+		}
+		fmt.Println(col.Name, col.Type, typ, col.Required)
+
 		fields = append(fields, reflect.StructField{
-			Name: upperFirst(key),
-			Type: reflect.TypeOf(value),
-			Tag:  reflect.StructTag(fmt.Sprintf(`yson:"%s"`, strings.ToLower(key))),
-		})
+			Name: exportFieldName(col.Name), // <-- важно: экспортируемое имя
+			Type: typ,
+			Tag:  reflect.StructTag(fmt.Sprintf(`yson:"%s" json:"%s"`, col.Name, col.Name))})
 	}
-	typ := reflect.StructOf(fields)
-	v := reflect.New(typ).Elem()
-	return v
+
+	st := reflect.StructOf(fields)
+	v := reflect.New(st).Elem()
+	reader.tableSchema = v.Type()
+
+	return nil
 }
 
-func (reader *Reader) ReadPartition(offset, limit uint64) *[]Row {
-	var partition = make([]Row, 0, limit-offset)
+func (reader *Reader) ReadPartition(offset, limit uint64) (reflect.Value, error) {
+	// т.е. [offset:limit)
+	if limit < offset {
+		limit = offset
+	}
+
+	sliceType := reflect.SliceOf(reader.tableSchema)
+	partition := reflect.MakeSlice(sliceType, 0, int(limit-offset))
+
 	currentPart := fmt.Sprintf("[#%d:#%d]", offset, limit)
 	partitionPath := ypath.Path(reader.Path.String() + currentPart)
-	log.Printf(string(partitionPath))
-	readerSession, err := reader.Client.Client.ReadTable(*reader.Ctx, partitionPath, nil)
+
+	rs, err := reader.Client.Client.ReadTable(*reader.Ctx, partitionPath, &yt.ReadTableOptions{
+		Unordered: true,
+		Smart:     ptr.Bool(true),
+	})
 	if err != nil {
-		fmt.Println(err)
-		return nil
+		return reflect.Value{}, err
 	}
-	defer readerSession.Close()
-	for readerSession.Next() {
-		var row Row
-		readerSession.Scan(&row)
-		partition = append(partition, row)
+	defer func() { _ = rs.Close() }()
+
+	for rs.Next() {
+		rowPtr := reflect.New(reader.tableSchema) // *T
+		if err := rs.Scan(rowPtr.Interface()); err != nil {
+			fmt.Println(err)
+			return reflect.Value{}, err
+		}
+		partition = reflect.Append(partition, rowPtr.Elem()) // append T
 	}
-	runtime.GC()
-	return &partition
+	if err := rs.Err(); err != nil {
+		return reflect.Value{}, err
+	}
+	fmt.Println(partitionPath)
+	return partition, nil
 }
 
-func (reader *Reader) ReadPartitionJson(limit, offset uint64) RowJson {
-	currentPart := fmt.Sprintf("[#%d:#%d]", limit, offset)
-	partitionPath := ypath.Path(reader.Path.String() + currentPart)
-	log.Println(string(partitionPath))
-
-	readerSession, err := reader.Client.Client.ReadTable(*reader.Ctx, partitionPath, nil)
+func (reader *Reader) ReadTableJson(tableName string) (*mem_storage.Table, error) {
+	newTable, err := mem_storage.NewTable(tableName, "json")
 	if err != nil {
-		log.Printf("Error reading table: %v", err)
-		return nil
+		return nil, err
 	}
-	defer readerSession.Close()
 
-	var buffer bytes.Buffer
-	first := true
-	var i = 0
-	for readerSession.Next() {
-		var row Row
-		if err := readerSession.Scan(&row); err != nil {
-			log.Printf("Error scanning row: %v", err)
-			continue
-		}
-
-		marshalled, err := json.Marshal(row)
-		if err != nil {
-			log.Printf("Error marshalling row: %v", err)
-			continue
-		}
-
-		if !first {
-			buffer.WriteByte(',')
-		} else {
-			first = false
-		}
-
-		buffer.Write(marshalled)
-		i++
+	writer, err := newTable.NewWriter()
+	if err != nil {
+		func() { _ = newTable.Drop() }()
+		return nil, fmt.Errorf("failed to create new writer: %w", err)
 	}
-	fmt.Println("count: ", i)
-	return buffer.Bytes()
+
+	workerCount := GetWorkerPool()
+	batchSize := GetBatchSize()
+	rowCount := reader.RowCount
+
+	sem := make(chan struct{}, workerCount)
+
+	errCh := make(chan error, workerCount)
+
+	var wg sync.WaitGroup
+
+	for start := uint64(0); start < rowCount; start += batchSize {
+		end := start + batchSize
+		if end > rowCount {
+			end = rowCount
+		}
+
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func(start, end uint64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			part, err := reader.ReadPartition(start, end)
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+
+			if err := writer.WritePartition(part.Interface()); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+		}(start, end)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	if err := <-errCh; err != nil {
+		func() { _ = newTable.Drop() }()
+		return nil, fmt.Errorf("failed to write partition: %+v", err)
+	}
+
+	return newTable, nil
 }
 
-func (reader *Reader) ReadTableJson() *RowJson {
-	var parts = make([]RowJson, 0)
-	var buffer bytes.Buffer
+func (reader *Reader) ReadTable() (reflect.Value, error) {
+	rowCount := reader.RowCount
+	batchSize := GetBatchSize()
+
+	sliceType := reflect.SliceOf(reader.tableSchema)
+	table := reflect.MakeSlice(sliceType, 0, int(rowCount))
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	buffer.Write([]byte("["))
-	for i := 0; i <= int(reader.RowCount); i += BatchSize {
+	workerCount := GetWorkerPool()
+	sem := make(chan struct{}, workerCount)
+
+	errCh := make(chan error, workerCount)
+
+	for start := uint64(0); start < rowCount; start += batchSize {
+		end := start + batchSize
+		if end > rowCount {
+			end = rowCount
+		}
+
+		sem <- struct{}{}
 		wg.Add(1)
-		go func() {
+
+		go func(start, end uint64) {
 			defer wg.Done()
-			part := reader.ReadPartitionJson(uint64(i), uint64(i+BatchSize-1))
+			defer func() { <-sem }()
+
+			part, err := reader.ReadPartition(start, end)
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+
 			mu.Lock()
-			parts = append(parts, part)
+			table = reflect.AppendSlice(table, part)
 			mu.Unlock()
-		}()
+		}(start, end)
 	}
+
 	wg.Wait()
-	buffer.Write(bytes.Join(parts, []byte(", ")))
-	buffer.Write([]byte("]"))
-	result := buffer.Bytes()
-	runtime.GC()
-	return &result
+	close(errCh)
 
-}
-
-func (reader *Reader) ReadTable() (*[]Row, error) {
-	var table = make([]Row, 0, reader.RowCount)
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for i := 0; i <= int(reader.RowCount); i += BatchSize {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			part := reader.ReadPartition(uint64(i), uint64(i+BatchSize-1))
-			mu.Lock()
-			table = append(table, *part...)
-			mu.Unlock()
-		}()
+	if err := <-errCh; err != nil {
+		return reflect.Value{}, err
 	}
-	wg.Wait()
-	runtime.GC()
-	return &table, nil
+	return table, nil
 }

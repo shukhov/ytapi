@@ -6,14 +6,19 @@ import (
 	"github.com/shukhov/ytapi/client"
 	"github.com/shukhov/ytapi/tools/table"
 	"go.ytsaurus.tech/yt/go/yt"
-	"golang.org/x/exp/rand"
 	"log"
+	"math/rand/v2"
 	"time"
 )
 
 var (
 	TempDir  = "//tmp"
-	template = "USE `%s`; \n INSERT INTO `%s/%d` WITH (TRUNCATE, EXPIRATION=\"2d\")\n%s"
+	template = "USE `%s`;\n" +
+		"DEFINE SUBQUERY $main() AS\n" +
+		"%s\n" +
+		"END DEFINE;\n" +
+		"INSERT INTO `%s` WITH (TRUNCATE, USER_ATTRS='{expiration_time=\"%s\"}')\n" +
+		"SELECT * FROM $main()"
 )
 
 type Select struct {
@@ -23,15 +28,17 @@ type Select struct {
 	TempTable string
 }
 
-func formatQuery(query string, cluster string) (string, string) {
-	randNum := rand.Int31()
-	newQuery := fmt.Sprintf(template, cluster, TempDir, randNum, query)
-	tempTable := fmt.Sprintf("%s/%d", TempDir, randNum)
+func formatQuery(cluster string, query string) (string, string) {
+	tableName := fmt.Sprintf("%d_%d", time.Now().Second(), rand.Uint32())
+	tempTable := fmt.Sprintf("%s/%s", TempDir, tableName)
+	ttl := time.Now().AddDate(0, 0, 3).UTC().Format("2006-01-02T15:04:05")
+
+	newQuery := fmt.Sprintf(template, cluster, query, tempTable, ttl)
 	return newQuery, tempTable
 }
 
 func NewSelect(client *client.Client, query string, ctx *context.Context) (*Select, error) {
-	formattedQuery, tempTable := formatQuery(query, client.Cluster)
+	formattedQuery, tempTable := formatQuery(client.Cluster, query)
 	log.Println(formattedQuery)
 	qid, err := client.Client.StartQuery(*ctx, yt.QueryEngineYQL, formattedQuery, &yt.StartQueryOptions{
 		Settings: map[string]any{
